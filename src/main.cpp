@@ -107,14 +107,14 @@ void drawBootPage(bool fail) {
 }
 
 // ---------- 主页面元素 ----------
-// 新布局（240x240）：下半部分左右分栏，左时钟、右额度
-//   ┌─ logo(居中) ────────────────────┐ y=1
-//   ├─ 横线 y=40 ─────────────────────┤
-//   │ 时钟栏 x0..120 │ 额度栏 x122..234 │
-//   │  HH:MM (12pt)  │ 5H    行 y=46    │
-//   │  ───────       │ WEEK  行 y=106   │
-//   │  UPD 08-28 ... │ MONTH 行 y=166   │
-//   └─ 错误条 y=226..240 ──────────────┘
+// 新布局（240x240）：下半部分左右分栏，左时钟（HH/MM 两行）、右额度
+//   ┌─ logo(居中) ──────────────────────┐ y=1
+//   ├─ 横线 y=40 ───────────────────────┤
+//   │ 时钟栏 x0..120 │ 状态行 UPDATE 22:00 │ y=44
+//   │  HH  (F7 48px) │ 5H    行 y=58     │
+//   │  ───────       │ WEEK  行 y=114    │
+//   │  MM  (F7 48px) │ MONTH 行 y=170    │
+//   └─ 错误条 y=226..240 ────────────────┘
 uint16_t barColorFor(int remaining) {
     if (remaining >= 50) return C_GREEN;
     if (remaining >= 20) return C_YELLOW;
@@ -124,7 +124,10 @@ uint16_t barColorFor(int remaining) {
 // 额度栏几何：整体右移收窄到右侧一列，进度条缩短但保持可读
 static const int QUOTA_X0 = 124;   // 内容左边界
 static const int QUOTA_X1 = 232;   // 右对齐基准
-static const int ROW_H = 60;       // 每行高度（比原来紧凑，给底部错误条让位）
+static const int ROW_H = 56;       // 三行额度行高（让出顶部状态行后压缩，进度条仍可读）
+static const int ROW_TOP = 58;     // 第一行额度顶部 y（其上是状态行）
+static const int STATUS_Y = 44;    // 右栏顶部状态行（最后更新时间）顶部 y
+static const int STATUS_H = 14;    // 状态行高度（slim）
 
 // 一行额度：标题/百分比在上，进度条居中，重置时间用小字放底部
 void drawQuotaRow(int y, const char *label, const OpenCodeGoWindow &w) {
@@ -159,11 +162,11 @@ void drawQuotaRow(int y, const char *label, const OpenCodeGoWindow &w) {
 }
 
 // 左栏时钟区 bounding box（只覆盖左栏，不含分隔线/右栏/logo）：
-// 大字 HH:MM  y 112..131、下划线 y=136、UPD 小字 y 148..156
+// HH 大字 y 70..117、短分隔线 y=134、MM 大字 y 150..197（Font 7 字高 48）
 static const int CLOCK_X = 0;
-static const int CLOCK_Y = 106;
+static const int CLOCK_Y = 64;
 static const int CLOCK_W = 120;
-static const int CLOCK_H = 60;
+static const int CLOCK_H = 140;
 
 // 上次绘制的本地分钟（hour*60+min）；-1 = 尚未绘制。
 // 用"小时+分钟"组合比较，避免整点(如 08:59 -> 09:00)被只看分钟时误判
@@ -179,33 +182,37 @@ static int currentLocalMinute() {
     return tmv.tm_hour * 60 + tmv.tm_min;
 }
 
-// 左栏时钟：大字当前时间 + 下方最后成功更新时间
-// 注意：内置字体只有 ASCII 字形，中文无法显示，故用 UPD / NO UPDATE 表达。
+// TFT_eSPI 内置 Font 7（七段数码管）：字高 48（chr_hgt_f7s），
+// 数字 0-9 与 '-' 字宽均为 32（满格），仅含 [space] 0-9 : . - ；
+// platformio.ini 已 -DLOAD_FONT7，不占额外 Flash。
+// 测宽必须与绘制同一字体：先 setTextFont(7) 再 textWidth，不与 FreeSans helper 混用。
+static void drawSegText(int cx, int y, const String &s, uint16_t color) {
+    tft.setTextFont(7);
+    int w = tft.textWidth(s); // 同字体测宽后水平居中
+    tft.setTextColor(color);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(s, cx - w / 2, y);
+}
+
+// 左栏时钟：HH 大字在上、MM 大字在下（均 Font 7，字高 48），中间一条短分隔线
 void drawClock() {
     const int cx = 60; // 左栏水平中心
 
     int minuteOfDay = currentLocalMinute();
-    String hhmm;
-    if (minuteOfDay >= 0)
-        hhmm = sd2::formatLocalTime(time(nullptr), "%H:%M");
-    else
-        hhmm = "--:--";
+    String hh = "--", mm = "--";
+    if (minuteOfDay >= 0) {
+        hh = sd2::formatLocalTime(time(nullptr), "%H");
+        mm = sd2::formatLocalTime(time(nullptr), "%M");
+    }
 
-    int tw = textWidth(hhmm, &FreeSans12pt7b);
-    drawText(cx - tw / 2, 112, hhmm, C_WHITE, &FreeSans12pt7b);
-    // 时钟下划线：强调"当前时间"这一焦点
-    tft.drawFastHLine(cx - tw / 2 - 4, 136, tw + 8, C_ACCENT);
+    drawSegText(cx, 70, hh, C_WHITE); // 字高 48 -> 占 y 70..117
 
-    String upd;
-    if (lastSuccessTime == 0)
-        upd = "NO UPDATE";
-    else
-        upd = "UPD " + sd2::formatLocalTime(lastSuccessTime, "%m-%d %H:%M");
+    // 短分隔线：分隔时与分
+    tft.drawFastHLine(cx - 28, 134, 56, C_ACCENT);
 
-    int uw = miniTextWidth(upd);
-    drawMiniText(cx - uw / 2, 148, upd, C_SUB);
+    drawSegText(cx, 150, mm, C_WHITE); // 占 y 150..197
 
-    // 记录本次绘制的分钟，供 tick 去重（未同步时不记录，保持 --:-- 可继续尝试）
+    // 记录本次绘制的分钟，供 tick 去重（未同步时不记录，保持 --/-- 可继续尝试）
     if (minuteOfDay >= 0)
         lastClockMinute = minuteOfDay;
 }
@@ -221,17 +228,30 @@ static void tickClock() {
 
     tft.startWrite();
     tft.fillRect(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H, C_BG);
-    drawClock(); // HH:MM + 下划线 + UPD 小字一并重画
+    drawClock(); // HH / MM 两行大字 + 短分隔线一并重画
     tft.endWrite();
 }
 
-// 正文区域（时钟栏 + 额度栏 + 分隔线）；调用前须保证该区域已清底
+// 右栏顶部 slim 状态行：最后成功更新时间（小字右对齐，只显示时分）
+// 注意：内置字体只有 ASCII 字形，中文无法显示，故用 UPDATE / NO UPDATE 表达。
+void drawUpdateRow() {
+    tft.fillRect(122, STATUS_Y, 112, STATUS_H, C_BG);
+    String upd;
+    if (lastSuccessTime == 0)
+        upd = "NO UPDATE";
+    else
+        upd = "UPDATE " + sd2::formatLocalTime(lastSuccessTime, "%H:%M");
+    drawMiniText(QUOTA_X1 - miniTextWidth(upd), STATUS_Y + 4, upd, C_SUB);
+}
+
+// 正文区域（时钟栏 + 状态行 + 额度栏 + 分隔线）；调用前须保证该区域已清底
 void drawBody() {
-    drawQuotaRow(46, "5H", lastData.rolling);
-    drawQuotaRow(46 + ROW_H, "WK.", lastData.weekly);
-    drawQuotaRow(46 + ROW_H * 2, "MO.", lastData.monthly);
+    drawUpdateRow();
+    drawQuotaRow(ROW_TOP, "5H", lastData.rolling);
+    drawQuotaRow(ROW_TOP + ROW_H, "WK.", lastData.weekly);
+    drawQuotaRow(ROW_TOP + ROW_H * 2, "MO.", lastData.monthly);
     drawClock();
-    tft.drawFastVLine(120, 46, ROW_H * 3, C_BORDER);
+    tft.drawFastVLine(120, STATUS_Y, STATUS_H + ROW_H * 3, C_BORDER);
 }
 
 void drawMainPage() {
