@@ -8,6 +8,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
 #include <Esp.h>
 #include <SD2Common.h>
 
@@ -39,8 +40,6 @@ struct OpenCodeGoUsage {
 
 static sd2::Https https(GTS_ROOT_R4_PEM, VERIFY_TLS_CERT);
 
-#define OPENCODE_API_HOST "opencode.ai"
-
 static String openCodeSessionId() {
     static String id;
     if (id.length() == 0) {
@@ -59,13 +58,18 @@ static void parseWindow(const JsonObject &obj, OpenCodeGoWindow &out) {
     out.valid = out.status != "invalid";
 }
 
-static bool fetchOpenCodeGoUsage(OpenCodeGoUsage &out, uint32_t timeout_ms = 15000) {
-    out = OpenCodeGoUsage();
+static bool isRetryableCode(int c) {
+    // 401 = Key 无效；403 = Key 有效但没有 Go 订阅，重试无意义
+    if (c == 401 || c == 403) return false;
+    // 其余均可重试：含 0（建连失败/响应不完整）/429/5xx/解析失败
+    return true;
+}
 
+static bool fetchOpenCodeGoUsageOnce(OpenCodeGoUsage &out, uint32_t timeout_ms) {
     sd2::HttpResponse resp;
     String error;
     String sessionHeader = "x-opencode-session: " + openCodeSessionId();
-    if (!https.get(OPENCODE_API_HOST, "/zen/go/v1/usage",
+    if (!https.get(OPENCODE_API_HOST, OPENCODE_API_PATH,
                    OPENCODE_GO_API_KEY, "cc-switch/1.0",
                    resp, error, timeout_ms, sessionHeader.c_str())) {
         out.error = error;
@@ -75,7 +79,17 @@ static bool fetchOpenCodeGoUsage(OpenCodeGoUsage &out, uint32_t timeout_ms = 150
     Serial.printf("HTTP %d, body %u B\n",
                   out.http_code, (unsigned)resp.body.length());
 
-    DynamicJsonDocument doc(1024);
+    // http_code==0：建连失败/响应不完整，视为可重试网络错误
+    if (out.http_code == 0) {
+        out.error = "Network error";
+        return false;
+    }
+    if (resp.body.length() == 0) {
+        out.error = "Empty response";
+        return false;
+    }
+
+    DynamicJsonDocument doc(2048);
     DeserializationError err = deserializeJson(doc, resp.body);
     if (err) {
         Serial.printf("JSON parse error: %s\n", err.c_str());
@@ -116,4 +130,63 @@ static bool fetchOpenCodeGoUsage(OpenCodeGoUsage &out, uint32_t timeout_ms = 150
         out.error = "HTTP " + String(out.http_code);
     }
     return false;
+}
+
+// 带重试的获取入口：指数退避（等待 = retry_interval_ms * attempt，上限 30000ms
+// + random(0,1000) 抖动，attempt 从 1 计），直到成功或用完 max_attempts 次。
+// 401/403 立即返回；http_code==0 视为可重试网络错误（保留 "Network error"）。
+static bool fetchOpenCodeGoUsage(OpenCodeGoUsage &out,
+                                 uint32_t timeout_ms = 15000,
+                                 uint32_t retry_interval_ms = 10000,
+                                 int max_attempts = FETCH_MAX_ATTEMPTS) {
+    bool ok = false;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        out = OpenCodeGoUsage();
+        // 每次 attempt 开始前检查 WiFi，掉线则尝试重连
+        if (WiFi.status() != WL_CONNECTED) {
+            WiFi.reconnect();
+            delay(500);
+            if (WiFi.status() != WL_CONNECTED) {
+                out.error = "WiFi lost";
+                Serial.printf("Fetch attempt %d/%d failed: %s (HTTP %d)\n",
+                              attempt, max_attempts, out.error.c_str(), out.http_code);
+                if (attempt < max_attempts) {
+                    uint32_t wait_ms = retry_interval_ms * (uint32_t)attempt;
+                    if (wait_ms > 30000) wait_ms = 30000;
+                    wait_ms += random(0, 1000);
+                    Serial.printf("Retry in %lu ms\n", (unsigned long)wait_ms);
+                    for (uint32_t waited = 0; waited < wait_ms; waited += 200) {
+                        yield();
+                        delay(200);
+                        if (WiFi.status() != WL_CONNECTED) break;
+                    }
+                }
+                continue;
+            }
+        }
+        ok = fetchOpenCodeGoUsageOnce(out, timeout_ms);
+        if (ok) {
+            if (attempt > 1)
+                Serial.printf("Fetch recovered on attempt %d\n", attempt);
+            return true;
+        }
+        Serial.printf("Fetch attempt %d/%d failed: %s (HTTP %d)\n",
+                      attempt, max_attempts, out.error.c_str(), out.http_code);
+        // 鉴权/订阅类错误重试无意义，直接返回
+        if (!isRetryableCode(out.http_code)) return false;
+        if (attempt < max_attempts) {
+            // 指数退避：等待 = retry_interval_ms * attempt，上限 30000ms + 抖动
+            uint32_t wait_ms = retry_interval_ms * (uint32_t)attempt;
+            if (wait_ms > 30000) wait_ms = 30000;
+            wait_ms += random(0, 1000);
+            Serial.printf("Retry in %lu ms\n", (unsigned long)wait_ms);
+            // 分片等待：每 200ms 一片 yield()，片间检查 WiFi，掉线提前跳出
+            for (uint32_t waited = 0; waited < wait_ms; waited += 200) {
+                yield();
+                delay(200);
+                if (WiFi.status() != WL_CONNECTED) break;
+            }
+        }
+    }
+    return ok;
 }

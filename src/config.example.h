@@ -11,6 +11,8 @@
 const char WIFI_SSID[] = "your-wifi-ssid";
 const char WIFI_PASSWORD[] = "your-wifi-password";
 
+#define OPENCODE_API_HOST "opencode.ai"
+#define OPENCODE_API_PATH "/zen/go/v1/usage"
 // ---- OpenCode Go API Key ----
 // 在 https://opencode.ai 的 Zen / Go 套餐页创建（Anthropic 兼容 API Key）
 // 固件请求：GET https://opencode.ai/zen/go/v1/usage
@@ -18,6 +20,13 @@ const char OPENCODE_GO_API_KEY[] = "sk-your-opencode-go-api-key";
 
 // ---- 刷新间隔（毫秒）----
 const uint32_t POLL_INTERVAL_MS = 5UL * 60UL * 1000UL; // 默认 5 分钟
+
+// ---- 获取失败重试 ----
+// 指数退避（等待 = FETCH_RETRY_INTERVAL_MS * attempt，上限 30s + 抖动），最多
+// FETCH_MAX_ATTEMPTS 次；无数据时 30s 快速重试，有数据才等满轮询周期
+#define FETCH_RETRY_INTERVAL_MS 10000UL
+#define FETCH_MAX_ATTEMPTS 3
+#define FAST_RETRY_MS 30000UL
 
 // ---- HTTPS 证书校验 ----
 // 1 = 校验证书（默认，内置 Google GTS Root R4，见 cert.h）

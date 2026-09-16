@@ -174,7 +174,9 @@ void handleFetch() {
     }
 
     OpenCodeGoUsage d;
-    bool ok = fetchOpenCodeGoUsage(d);
+    // 失败时内部指数退避自动重试，最多 FETCH_MAX_ATTEMPTS 次
+    bool ok = fetchOpenCodeGoUsage(d, 15000, FETCH_RETRY_INTERVAL_MS,
+                                   FETCH_MAX_ATTEMPTS);
     lastFetchMs = millis();
 
     if (ok) {
@@ -185,6 +187,7 @@ void handleFetch() {
                       d.rolling.percent, d.weekly.percent, d.monthly.percent);
 
         tft.startWrite(); // 单事务批量重绘，避免逐块清空闪动
+        tft.fillRect(0, 226, 240, 14, C_BG); // 清除上次的错误提示
         drawQuotaRow(46, "5H", d.rolling);
         drawQuotaRow(110, "WEEK", d.weekly);
         drawQuotaRow(174, "MONTH", d.monthly);
@@ -192,7 +195,17 @@ void handleFetch() {
         tft.drawFastHLine(20, 174, 204, C_BORDER);
         tft.endWrite();
     } else {
-        Serial.printf("Fetch failed: %s (HTTP %d)\n", d.error.c_str(), d.http_code);
+        Serial.printf("Fetch failed after retries: %s (HTTP %d)\n",
+                      d.error.c_str(), d.http_code);
+        // 无数据时 30s 快速重试，有数据才等满轮询周期；无新增阻塞 delay
+        if (!hasData) {
+            lastFetchMs = millis() - POLL_INTERVAL_MS + FAST_RETRY_MS;
+        }
+        // 屏幕上提示错误，下次成功会自动重绘覆盖
+        tft.startWrite();
+        tft.fillRect(0, 226, 240, 14, C_BG);
+        drawMiniText(20, 228, "ERR " + d.error, C_RED);
+        tft.endWrite();
     }
 }
 
