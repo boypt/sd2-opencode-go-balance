@@ -8,7 +8,8 @@
 //
 //  公共基础功能来自 sd2-common（WiFi/NTP/休眠/背光/HTTP/格式化）
 //  使用前先修改 src/config.h（WiFi / API Key）
-//  显示三行额度: 5H / WEEK / MONTH，剩余百分比 + 重置时间
+//  显示：左侧当前时间 + 最后更新时间；右侧三行额度
+//        5H / WEEK / MONTH，剩余百分比 + 重置时间
 // ============================================================
 
 #include <Arduino.h>
@@ -35,6 +36,10 @@ static uint32_t &lastFetchMs = app.lastFetchMs;
 static bool hasData = false;
 
 static OpenCodeGoUsage lastData;
+
+// 最后一次成功获取数据的本地时间（time(nullptr)）；
+// 0 表示从未成功，用于与"当前时钟"区分
+static time_t lastSuccessTime = 0;
 
 // ---------- 界面工具 ----------
 void drawText(int x, int y, const String &s, uint16_t color, const GFXfont *font) {
@@ -102,16 +107,29 @@ void drawBootPage(bool fail) {
 }
 
 // ---------- 主页面元素 ----------
+// 新布局（240x240）：下半部分左右分栏，左时钟、右额度
+//   ┌─ logo(居中) ────────────────────┐ y=1
+//   ├─ 横线 y=40 ─────────────────────┤
+//   │ 时钟栏 x0..120 │ 额度栏 x122..234 │
+//   │  HH:MM (12pt)  │ 5H    行 y=46    │
+//   │  ───────       │ WEEK  行 y=106   │
+//   │  UPD 08-28 ... │ MONTH 行 y=166   │
+//   └─ 错误条 y=226..240 ──────────────┘
 uint16_t barColorFor(int remaining) {
     if (remaining >= 50) return C_GREEN;
     if (remaining >= 20) return C_YELLOW;
     return C_RED;
 }
 
+// 额度栏几何：整体右移收窄到右侧一列，进度条缩短但保持可读
+static const int QUOTA_X0 = 124;   // 内容左边界
+static const int QUOTA_X1 = 232;   // 右对齐基准
+static const int ROW_H = 60;       // 每行高度（比原来紧凑，给底部错误条让位）
+
 // 一行额度：标题/百分比在上，进度条居中，重置时间用小字放底部
 void drawQuotaRow(int y, const char *label, const OpenCodeGoWindow &w) {
-    tft.fillRect(18, y, 204, 64, C_BG);
-    drawText(20, y + 3, label, C_LABEL, &FreeSans9pt7b);
+    tft.fillRect(122, y, 112, ROW_H, C_BG);
+    drawText(QUOTA_X0, y + 3, label, C_LABEL, &FreeSans9pt7b);
 
     String pct = "--";
     uint16_t pctColor = C_RED;
@@ -122,34 +140,108 @@ void drawQuotaRow(int y, const char *label, const OpenCodeGoWindow &w) {
         pctColor = C_WHITE;
     }
     int pw = textWidth(pct, &FreeSans12pt7b);
-    drawText(220 - pw, y + 2, pct, pctColor, &FreeSans12pt7b);
+    drawText(QUOTA_X1 - pw, y + 2, pct, pctColor, &FreeSans12pt7b);
 
-    tft.fillRect(20, y + 30, 204, 12, C_BORDER);
+    tft.fillRect(QUOTA_X0, y + 28, QUOTA_X1 - QUOTA_X0, 12, C_BORDER);
     if (w.present && w.valid && remaining > 0) {
-        tft.fillRect(20, y + 30, 204L * remaining / 100, 12, barColorFor(remaining));
+        tft.fillRect(QUOTA_X0, y + 28,
+                     (int32_t)(QUOTA_X1 - QUOTA_X0) * remaining / 100, 12,
+                     barColorFor(remaining));
     }
 
     if (w.present && !w.valid) {
-        drawMiniText(220 - miniTextWidth("INVALID"), y + 48, "INVALID", C_RED);
+        drawMiniText(QUOTA_X1 - miniTextWidth("INVALID"), y + 44, "INVALID", C_RED);
     } else {
         String reset = formatReset(w.resetsAt);
         if (reset.length() > 0)
-            drawMiniText(220 - miniTextWidth(reset), y + 48, reset, C_SUB);
+            drawMiniText(QUOTA_X1 - miniTextWidth(reset), y + 44, reset, C_SUB);
     }
+}
+
+// 左栏时钟区 bounding box（只覆盖左栏，不含分隔线/右栏/logo）：
+// 大字 HH:MM  y 112..131、下划线 y=136、UPD 小字 y 148..156
+static const int CLOCK_X = 0;
+static const int CLOCK_Y = 106;
+static const int CLOCK_W = 120;
+static const int CLOCK_H = 60;
+
+// 上次绘制的本地分钟（hour*60+min）；-1 = 尚未绘制。
+// 用"小时+分钟"组合比较，避免整点(如 08:59 -> 09:00)被只看分钟时误判
+static int lastClockMinute = -1;
+
+// 当前本地分钟（hour*60+min）；NTP 未同步返回 -1
+static int currentLocalMinute() {
+    if (!sd2::timeSynced())
+        return -1;
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    return tmv.tm_hour * 60 + tmv.tm_min;
+}
+
+// 左栏时钟：大字当前时间 + 下方最后成功更新时间
+// 注意：内置字体只有 ASCII 字形，中文无法显示，故用 UPD / NO UPDATE 表达。
+void drawClock() {
+    const int cx = 60; // 左栏水平中心
+
+    int minuteOfDay = currentLocalMinute();
+    String hhmm;
+    if (minuteOfDay >= 0)
+        hhmm = sd2::formatLocalTime(time(nullptr), "%H:%M");
+    else
+        hhmm = "--:--";
+
+    int tw = textWidth(hhmm, &FreeSans12pt7b);
+    drawText(cx - tw / 2, 112, hhmm, C_WHITE, &FreeSans12pt7b);
+    // 时钟下划线：强调"当前时间"这一焦点
+    tft.drawFastHLine(cx - tw / 2 - 4, 136, tw + 8, C_ACCENT);
+
+    String upd;
+    if (lastSuccessTime == 0)
+        upd = "NO UPDATE";
+    else
+        upd = "UPD " + sd2::formatLocalTime(lastSuccessTime, "%m-%d %H:%M");
+
+    int uw = miniTextWidth(upd);
+    drawMiniText(cx - uw / 2, 148, upd, C_SUB);
+
+    // 记录本次绘制的分钟，供 tick 去重（未同步时不记录，保持 --:-- 可继续尝试）
+    if (minuteOfDay >= 0)
+        lastClockMinute = minuteOfDay;
+}
+
+// 常驻分钟 tick：仅当本地分钟变化时局部重绘时钟区，
+// 避免每 20ms 的 loop 全量刷新造成闪烁
+static void tickClock() {
+    if (sleepSched.sleeping())     // 休眠中不刷新（背光已关）
+        return;
+    int m = currentLocalMinute();
+    if (m < 0 || m == lastClockMinute) // 未同步 / 分钟未变则不重绘
+        return;
+
+    tft.startWrite();
+    tft.fillRect(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H, C_BG);
+    drawClock(); // HH:MM + 下划线 + UPD 小字一并重画
+    tft.endWrite();
+}
+
+// 正文区域（时钟栏 + 额度栏 + 分隔线）；调用前须保证该区域已清底
+void drawBody() {
+    drawQuotaRow(46, "5H", lastData.rolling);
+    drawQuotaRow(46 + ROW_H, "WK.", lastData.weekly);
+    drawQuotaRow(46 + ROW_H * 2, "MO.", lastData.monthly);
+    drawClock();
+    tft.drawFastVLine(120, 46, ROW_H * 3, C_BORDER);
 }
 
 void drawMainPage() {
     tft.startWrite();
     tft.fillScreen(C_BG);
 
-    tft.pushImage(10, 1, OC_LOGO_W, OC_LOGO_H, oc_logo, 0x0000);
+    tft.pushImage((240 - OC_LOGO_W) / 2, 1, OC_LOGO_W, OC_LOGO_H, oc_logo, 0x0000);
     tft.drawFastHLine(16, 40, 208, C_BORDER);
 
-    drawQuotaRow(46, "5H", lastData.rolling);
-    drawQuotaRow(110, "WEEK", lastData.weekly);
-    drawQuotaRow(174, "MONTH", lastData.monthly);
-    tft.drawFastHLine(20, 110, 204, C_BORDER);
-    tft.drawFastHLine(20, 174, 204, C_BORDER);
+    drawBody();
 
     tft.endWrite();
 }
@@ -164,6 +256,10 @@ static void onWake() {
 }
 
 void handleFetch() {
+    // 常驻循环里的分钟时钟 tick：与网络/额度获取无关，放在最前，
+    // WiFi 掉线时也照样走时；内部自行跳过休眠与未同步
+    tickClock();
+
     if (!wifi.connected() || sleepSched.sleeping()) return;
     if (millis() - lastFetchMs < POLL_INTERVAL_MS) return;
 
@@ -182,17 +278,16 @@ void handleFetch() {
     if (ok) {
         hasData = true;
         lastData = d;
+        lastSuccessTime = time(nullptr);
 
         Serial.printf("Quota: 5h %d%% / week %d%% / month %d%%\n",
                       d.rolling.percent, d.weekly.percent, d.monthly.percent);
 
-        tft.startWrite(); // 单事务批量重绘，避免逐块清空闪动
-        tft.fillRect(0, 226, 240, 14, C_BG); // 清除上次的错误提示
-        drawQuotaRow(46, "5H", d.rolling);
-        drawQuotaRow(110, "WEEK", d.weekly);
-        drawQuotaRow(174, "MONTH", d.monthly);
-        tft.drawFastHLine(20, 110, 204, C_BORDER);
-        tft.drawFastHLine(20, 174, 204, C_BORDER);
+        // 局部重绘：清空正文 + 底部错误条，再重画整块正文（含时钟），
+        // 与 drawMainPage 的 drawBody 完全一致，避免残影、避免整屏闪动
+        tft.startWrite();
+        tft.fillRect(0, 44, 240, 240 - 44, C_BG); // 清除上次内容与错误提示
+        drawBody();
         tft.endWrite();
     } else {
         Serial.printf("Fetch failed after retries: %s (HTTP %d)\n",
@@ -204,7 +299,8 @@ void handleFetch() {
         // 屏幕上提示错误，下次成功会自动重绘覆盖
         tft.startWrite();
         tft.fillRect(0, 226, 240, 14, C_BG);
-        drawMiniText(20, 228, "ERR " + d.error, C_RED);
+        String err = "ERR " + d.error;
+        drawMiniText((240 - miniTextWidth(err)) / 2, 229, err, C_RED);
         tft.endWrite();
     }
 }
