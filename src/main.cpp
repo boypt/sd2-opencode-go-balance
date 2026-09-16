@@ -107,10 +107,10 @@ void drawBootPage(bool fail) {
 }
 
 // ---------- 主页面元素 ----------
-// 新布局（240x240）：下半部分左右分栏，左时钟（HH/MM 两行）、右额度
+// 新布局（240x240）：下半部分左右分栏，左时钟（日期 + HH/MM）、右额度
 //   ┌─ logo(居中) ──────────────────────┐ y=1
 //   ├─ 横线 y=40 ───────────────────────┤
-//   │ 时钟栏 x0..120 │ 状态行 UPDATE 22:00 │ y=44
+//   │ 日期 MM-DD WKD │ 状态行 UPDATE 22:00 │ y=44
 //   │  HH  (F7 48px) │ 5H    行 y=58     │
 //   │  ───────       │ WEEK  行 y=114    │
 //   │  MM  (F7 48px) │ MONTH 行 y=170    │
@@ -162,17 +162,28 @@ void drawQuotaRow(int y, const char *label, const OpenCodeGoWindow &w) {
 }
 
 // 左栏时钟区 bounding box（只覆盖左栏，不含分隔线/右栏/logo）：
-// HH 大字 y 70..117、短分隔线 y=134、MM 大字 y 150..197（Font 7 字高 48）
+// 日期 y50..57、HH 大字 y 70..117、分隔线 y=134（秒摆动）、MM 大字 y 150..197
 static const int CLOCK_X = 0;
-static const int CLOCK_Y = 64;
+static const int CLOCK_Y = 44;    // 向上扩大到覆盖日期行
 static const int CLOCK_W = 120;
-static const int CLOCK_H = 140;
+static const int CLOCK_H = 160;   // 44..203
 
-// 上次绘制的本地分钟（hour*60+min）；-1 = 尚未绘制。
-// 用"小时+分钟"组合比较，避免整点(如 08:59 -> 09:00)被只看分钟时误判
+// 分隔线（秒摆）几何：线体 SEP_W 宽，围绕左栏中心 cx=60 左右摆动 ±SEP_SWING
+static const int SEP_Y = 134;
+static const int SEP_W = 56;
+static const int SEP_SWING = 10;
+// 秒重绘条带：覆盖分隔线全部摆动位置 + 余量；y 夹在 HH 底(117) 与 MM 顶(150) 之间
+static const int SEP_STRIP_X = 18;
+static const int SEP_STRIP_Y = 131;
+static const int SEP_STRIP_W = 84;
+static const int SEP_STRIP_H = 6;
+
+// 上次绘制的本地分钟（hour*60+min）/ 秒；-1 = 尚未绘制。
+// 分钟用"小时+分钟"组合比较，避免整点(如 08:59 -> 09:00)被只看分钟时误判
 static int lastClockMinute = -1;
+static int lastClockSecond = -1;
 
-// 当前本地分钟（hour*60+min）；NTP 未同步返回 -1
+// 当前本地分钟（hour*60+min）/ 秒；NTP 未同步返回 -1
 static int currentLocalMinute() {
     if (!sd2::timeSynced())
         return -1;
@@ -180,6 +191,14 @@ static int currentLocalMinute() {
     struct tm tmv;
     localtime_r(&now, &tmv);
     return tmv.tm_hour * 60 + tmv.tm_min;
+}
+static int currentLocalSecond() {
+    if (!sd2::timeSynced())
+        return -1;
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    return tmv.tm_sec;
 }
 
 // TFT_eSPI 内置 Font 7（七段数码管）：字高 48（chr_hgt_f7s），
@@ -194,9 +213,44 @@ static void drawSegText(int cx, int y, const String &s, uint16_t color) {
     tft.drawString(s, cx - w / 2, y);
 }
 
-// 左栏时钟：HH 大字在上、MM 大字在下（均 Font 7，字高 48），中间一条短分隔线
+// 秒摆动：按当前秒做 4 步循环 左-中-右-中（sec&3），偏移 ±SEP_SWING
+static int sepOffsetForSecond(int sec) {
+    static const int kOffsets[4] = {-SEP_SWING, 0, SEP_SWING, 0};
+    return kOffsets[sec & 3];
+}
+
+// 短分隔线：已同步时按当前秒左右摆动，未同步时静态居中
+static void drawSeparator() {
+    int x = 60 - SEP_W / 2; // 居中基准
+    if (sd2::timeSynced())
+        x += sepOffsetForSecond(currentLocalSecond());
+    tft.drawFastHLine(x, SEP_Y, SEP_W, C_ACCENT);
+}
+
+// 左栏顶部日期星期：MM-DD WKD（星期为英文三字母，字体仅 ASCII）；
+// 未同步占位 "-- --"，同步后随分钟全盒重绘自动补上
+static void drawDateLine() {
+    String s;
+    if (sd2::timeSynced()) {
+        time_t now = time(nullptr);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        static const char *const kWeekday[7] = {"SUN", "MON", "TUE", "WED",
+                                                "THU", "FRI", "SAT"};
+        s = sd2::formatLocalTime(now, "%m-%d");
+        s += ' ';
+        s += kWeekday[tmv.tm_wday]; // tm_wday: 0=Sun .. 6=Sat
+    } else {
+        s = "-- --";
+    }
+    drawMiniText(4, 50, s, C_SUB); // 紧贴左沿
+}
+
+// 左栏时钟：日期在顶、HH 大字在中上、MM 大字在下，中间一条摆动分隔线
 void drawClock() {
     const int cx = 60; // 左栏水平中心
+
+    drawDateLine(); // 日期只在零点变化，由分钟/整盒重绘天然覆盖
 
     int minuteOfDay = currentLocalMinute();
     String hh = "--", mm = "--";
@@ -207,28 +261,45 @@ void drawClock() {
 
     drawSegText(cx, 70, hh, C_WHITE); // 字高 48 -> 占 y 70..117
 
-    // 短分隔线：分隔时与分
-    tft.drawFastHLine(cx - 28, 134, 56, C_ACCENT);
+    drawSeparator(); // 秒摆动分隔线（未同步时居中）
 
     drawSegText(cx, 150, mm, C_WHITE); // 占 y 150..197
 
-    // 记录本次绘制的分钟，供 tick 去重（未同步时不记录，保持 --/-- 可继续尝试）
-    if (minuteOfDay >= 0)
+    // 记录本次绘制的分钟/秒，供 tick 去重（未同步时不记录，保持 --/-- 可继续尝试）
+    if (minuteOfDay >= 0) {
         lastClockMinute = minuteOfDay;
+        lastClockSecond = currentLocalSecond();
+    }
 }
 
-// 常驻分钟 tick：仅当本地分钟变化时局部重绘时钟区，
-// 避免每 20ms 的 loop 全量刷新造成闪烁
+// 常驻 tick（loop ~20ms 进一次，仅变化时碰屏）：
+//  - 分钟变化：整块时钟盒重绘（数字 + 分隔线）
+//  - 秒变化：只清/重画分隔线小条带，不碰 HH/MM 数字
+// 休眠跳过；未同步保持静态居中、不摆动
 static void tickClock() {
     if (sleepSched.sleeping())     // 休眠中不刷新（背光已关）
         return;
+
     int m = currentLocalMinute();
-    if (m < 0 || m == lastClockMinute) // 未同步 / 分钟未变则不重绘
+    if (m < 0)                     // 未同步：分隔线保持静态居中
         return;
 
+    if (m != lastClockMinute) {    // 分钟变化 -> 全时钟盒重绘
+        tft.startWrite();
+        tft.fillRect(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H, C_BG);
+        drawClock(); // 一并更新 lastClockMinute / lastClockSecond
+        tft.endWrite();
+        return;
+    }
+
+    int s = currentLocalSecond();  // 秒变化 -> 只重画分隔线条带
+    if (s == lastClockSecond)
+        return;
+    lastClockSecond = s;
+
     tft.startWrite();
-    tft.fillRect(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H, C_BG);
-    drawClock(); // HH / MM 两行大字 + 短分隔线一并重画
+    tft.fillRect(SEP_STRIP_X, SEP_STRIP_Y, SEP_STRIP_W, SEP_STRIP_H, C_BG);
+    drawSeparator();
     tft.endWrite();
 }
 
