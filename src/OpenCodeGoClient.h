@@ -72,6 +72,9 @@ static bool fetchOpenCodeGoUsageOnce(OpenCodeGoUsage &out, uint32_t timeout_ms) 
     if (!https.get(OPENCODE_API_HOST, OPENCODE_API_PATH,
                    OPENCODE_GO_API_KEY, "cc-switch/1.0",
                    resp, error, timeout_ms, sessionHeader.c_str())) {
+        // 底层错误串可能偏长：只保留短 ASCII（截断至约 18 字符），不拼接长 body
+        if (error.length() == 0) error = "Network error";
+        if (error.length() > 18) error = error.substring(0, 18);
         out.error = error;
         return false;
     }

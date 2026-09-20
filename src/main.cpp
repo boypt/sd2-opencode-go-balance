@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <Esp.h>
 #include <time.h>
 #include <TFT_eSPI.h>
 #include <SD2Common.h>
@@ -40,6 +41,10 @@ static OpenCodeGoUsage lastData;
 // 最后一次成功获取数据的本地时间（time(nullptr)）；
 // 0 表示从未成功，用于与"当前时钟"区分
 static time_t lastSuccessTime = 0;
+
+// 持久化错误状态（ASCII短串，供 UPDATE 行显示；成功时清空）
+static String lastError;
+static int lastHttpCode = 0;
 
 // ---------- 界面工具 ----------
 void drawText(int x, int y, const String &s, uint16_t color, const GFXfont *font) {
@@ -305,14 +310,52 @@ static void tickClock() {
 
 // 右栏顶部 slim 状态行：最后成功更新时间（小字右对齐，只显示时分）
 // 注意：内置字体只有 ASCII 字形，中文无法显示，故用 UPDATE / NO UPDATE 表达。
+// 四态：
+//   无成功无错误 -> "NO UPDATE"
+//   无成功有错误 -> "ERR <lastError>"（截断至 mini 字体 112px 内）
+//   有成功无错误 -> "UPDATE HH:MM"
+//   有成功有错误 -> "UPDATE HH:MM E:<short>"（short 为简写，截断保 112px 内）
+// 错误态颜色用 C_RED（黑底可读），正常态 C_SUB。
+static String shortUpdateError() {
+    if (lastError.startsWith("Network")) return "Network";
+    if (lastError.startsWith("WiFi")) return "WiFi";
+    if (lastError.startsWith("HTTP")) return lastError; // "HTTP 429" 等已短
+    if (lastError.startsWith("Server")) return "Server";
+    if (lastError.startsWith("Response") || lastError.startsWith("Empty") ||
+        lastError.startsWith("Resp"))
+        return "Resp";
+    if (lastError.startsWith("Bad")) return "BadKey";
+    if (lastError.startsWith("No Go") || lastError.startsWith("NoPlan")) return "NoPlan";
+    if (lastError.startsWith("No Key") || lastError.startsWith("NoKey")) return "NoKey";
+    if (lastError.length() <= 8) return lastError;
+    return lastError.substring(0, 8);
+}
+
 void drawUpdateRow() {
     tft.fillRect(122, STATUS_Y, 112, STATUS_H, C_BG);
     String upd;
-    if (lastSuccessTime == 0)
+    uint16_t color = C_SUB;
+    bool hasErr = lastError.length() > 0;
+    if (lastSuccessTime == 0 && !hasErr) {
         upd = "NO UPDATE";
-    else
+    } else if (lastSuccessTime == 0 && hasErr) {
+        upd = "ERR " + lastError;
+        while (upd.length() > 4 && miniTextWidth(upd) > 112)
+            upd.remove(upd.length() - 1);
+        color = C_RED;
+    } else if (!hasErr) {
         upd = "UPDATE " + sd2::formatLocalTime(lastSuccessTime, "%H:%M");
-    drawMiniText(QUOTA_X1 - miniTextWidth(upd), STATUS_Y + 4, upd, C_SUB);
+    } else {
+        String base = "UPDATE " + sd2::formatLocalTime(lastSuccessTime, "%H:%M") + " E:";
+        String sh = shortUpdateError();
+        upd = base + sh;
+        while (sh.length() > 0 && miniTextWidth(upd) > 112) {
+            sh.remove(sh.length() - 1);
+            upd = base + sh;
+        }
+        color = C_RED;
+    }
+    drawMiniText(QUOTA_X1 - miniTextWidth(upd), STATUS_Y + 4, upd, color);
 }
 
 // 正文区域（时钟栏 + 状态行 + 额度栏 + 分隔线）；调用前须保证该区域已清底
@@ -357,19 +400,36 @@ void handleFetch() {
     // 未填 Key 时直接提示
     if (strlen(OPENCODE_GO_API_KEY) < 20) {
         lastFetchMs = millis();
+        lastError = "No Key";
+        lastHttpCode = 0;
+        yield();
+        tft.startWrite();
+        drawUpdateRow();
+        tft.endWrite();
+        yield();
         return;
     }
 
     OpenCodeGoUsage d;
     // 失败时内部指数退避自动重试，最多 FETCH_MAX_ATTEMPTS 次
+    Serial.printf("Fetch begin heap=%u maxblock=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxFreeBlockSize());
+    Serial.flush();
     bool ok = fetchOpenCodeGoUsage(d, 15000, FETCH_RETRY_INTERVAL_MS,
                                    FETCH_MAX_ATTEMPTS);
+    Serial.printf("Fetch end ok=%d heap=%u maxblock=%u\n", ok,
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxFreeBlockSize());
+    Serial.flush();
     lastFetchMs = millis();
 
     if (ok) {
         hasData = true;
         lastData = d;
         lastSuccessTime = time(nullptr);
+        lastError = "";
+        lastHttpCode = 0;
 
         Serial.printf("Quota: 5h %d%% / week %d%% / month %d%%\n",
                       d.rolling.percent, d.weekly.percent, d.monthly.percent);
@@ -381,18 +441,28 @@ void handleFetch() {
         drawBody();
         tft.endWrite();
     } else {
+        yield();
         Serial.printf("Fetch failed after retries: %s (HTTP %d)\n",
                       d.error.c_str(), d.http_code);
         // 无数据时 30s 快速重试，有数据才等满轮询周期；无新增阻塞 delay
         if (!hasData) {
             lastFetchMs = millis() - POLL_INTERVAL_MS + FAST_RETRY_MS;
         }
-        // 屏幕上提示错误，下次成功会自动重绘覆盖
+        // 持久化短错误串（截断至约 18 字符防溢出），供 UPDATE 行显示
+        String e = d.error;
+        if (e.length() == 0) e = "Fetch fail";
+        if (e.length() > 18) e = e.substring(0, 18);
+        lastError = e;
+        lastHttpCode = d.http_code;
+        // 屏幕上提示错误，下次成功会自动重绘覆盖；
+        // startWrite/endWrite 严格配对，中间无 early return，前后各一次 yield()
         tft.startWrite();
+        drawUpdateRow();
         tft.fillRect(0, 226, 240, 14, C_BG);
-        String err = "ERR " + d.error;
+        String err = "ERR " + lastError;
         drawMiniText((240 - miniTextWidth(err)) / 2, 229, err, C_RED);
         tft.endWrite();
+        yield();
     }
 }
 
@@ -401,6 +471,12 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(200);
     Serial.println();
+    Serial.printf("Reset: %s | free=%u maxblock=%u\n",
+                  ESP.getResetReason().c_str(),
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxFreeBlockSize());
+    Serial.printf("%s\n", ESP.getResetInfo().c_str());
+    Serial.flush();
     Serial.println("SD2 OpenCode Go quota monitor starting...");
 
     app.setHooks(drawBootPage, handleFetch, onConnected, nullptr, nullptr, onWake);
