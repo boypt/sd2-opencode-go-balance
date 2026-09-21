@@ -17,7 +17,7 @@
 #include <Esp.h>
 #include <time.h>
 #include <TFT_eSPI.h>
-#include <SD2Common.h>
+#include <Sd2Common.h>
 #include <Sd2App.h>
 
 #include "config.h"

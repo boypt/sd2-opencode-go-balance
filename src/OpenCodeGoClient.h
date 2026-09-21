@@ -10,7 +10,7 @@
 #include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <Esp.h>
-#include <SD2Common.h>
+#include <Sd2Common.h>
 
 #include "config.h"
 #include "cert.h"
