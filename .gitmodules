@@ -1,3 +1,6 @@
 [submodule "lib/sd2-common"]
 	path = lib/sd2-common
 	url = git@github.com:boypt/sd2-common.git
+[submodule "geekmagic"]
+	path = geekmagic
+	url = git@github.com:boypt/GeekMagic-Open-Opencode-GO.git
